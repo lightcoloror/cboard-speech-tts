@@ -4,7 +4,7 @@
   "description": "Cordova TTS plugin used by the Cboard mobile app",
   "homepage": "https://github.com/cboard-org/cboard-speech-tts#readme",
   "scripts": {
-    "test": "jasmine-node --color spec"
+    "test": "node --test test/*.test.js"
   },
   "repository": {
     "type": "git",

@@ -7,7 +7,9 @@ import java.util.ArrayList;
 import java.util.AbstractList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -33,7 +35,7 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
     private TextToSpeech mTts = null;
     private int state = STOPPED;
     private CallbackContext startupCallbackContext;
-    private CallbackContext callbackContext;
+    private final Map<String, CallbackContext> utteranceCallbacks = new ConcurrentHashMap<String, CallbackContext>();
 
     private Set<Voice> voiceList = null;
 
@@ -43,10 +45,14 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
     public boolean execute(String action, JSONArray args, CallbackContext callbackContext) {
         PluginResult.Status status = PluginResult.Status.OK;
         String result = "";
-        this.callbackContext = callbackContext;
 
         try {
             if (action.equals("speak")) {
+                if (!isReady()) {
+                    fireErrorEvent(callbackContext);
+                    return true;
+                }
+
                 JSONObject utterance = args.getJSONObject(0);
                 String text = utterance.getString("text");
 
@@ -78,10 +84,12 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
                 float rate = (float) utterance.optDouble("rate", 1.0);
                 mTts.setSpeechRate(rate);
 
-                if (isReady()) {
-                    HashMap<String, String> map = null;
-                    map = new HashMap<String, String>();
-                    map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, callbackContext.getCallbackId());
+                String utteranceId = callbackContext.getCallbackId();
+                HashMap<String, String> map = new HashMap<String, String>();
+                map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId);
+                utteranceCallbacks.put(utteranceId, callbackContext);
+                int speakResult = mTts.speak(text, TextToSpeech.QUEUE_ADD, map);
+                if (speakResult == TextToSpeech.SUCCESS) {
                     JSONObject event = new JSONObject();
                     event.put("type", "start");
                     event.put("charIndex", 0);
@@ -90,16 +98,14 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
                     PluginResult pr = new PluginResult(PluginResult.Status.OK, event);
                     pr.setKeepCallback(true);
                     callbackContext.sendPluginResult(pr);
-                    mTts.speak(text, TextToSpeech.QUEUE_ADD, map);
                 } else {
+                    utteranceCallbacks.remove(utteranceId);
                     fireErrorEvent(callbackContext);
                 }
             } else if (action.equals("cancel")) {
                 if (isReady()) {
-                    HashMap<String, String> map = null;
-                    map = new HashMap<String, String>();
-                    // map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, callbackId);
-                    mTts.speak("", TextToSpeech.QUEUE_FLUSH, map);
+                    mTts.stop();
+                    failPendingUtterances();
                     fireEndEvent(callbackContext);
                 } else {
                     fireErrorEvent(callbackContext);
@@ -111,19 +117,26 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
             } else if (action.equals("stop")) {
                 if (isReady()) {
                     mTts.stop();
+                    failPendingUtterances();
                     callbackContext.sendPluginResult(new PluginResult(status, result));
                 } else {
                     fireErrorEvent(callbackContext);
                 }
             } else if (action.equals("silence")) {
                 if (isReady()) {
-                    HashMap<String, String> map = null;
-                    map = new HashMap<String, String>();
-                    map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, callbackContext.getCallbackId());
-                    mTts.playSilence(args.getLong(0), TextToSpeech.QUEUE_ADD, map);
-                    PluginResult pr = new PluginResult(PluginResult.Status.NO_RESULT);
-                    pr.setKeepCallback(true);
-                    callbackContext.sendPluginResult(pr);
+                    String utteranceId = callbackContext.getCallbackId();
+                    HashMap<String, String> map = new HashMap<String, String>();
+                    map.put(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId);
+                    utteranceCallbacks.put(utteranceId, callbackContext);
+                    int silenceResult = mTts.playSilence(args.getLong(0), TextToSpeech.QUEUE_ADD, map);
+                    if (silenceResult == TextToSpeech.SUCCESS) {
+                        PluginResult pr = new PluginResult(PluginResult.Status.NO_RESULT);
+                        pr.setKeepCallback(true);
+                        callbackContext.sendPluginResult(pr);
+                    } else {
+                        utteranceCallbacks.remove(utteranceId);
+                        fireErrorEvent(callbackContext);
+                    }
                 } else {
                     fireErrorEvent(callbackContext);
                 }
@@ -154,6 +167,8 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
                 if (mTts != null) {
                     mTts.shutdown();
                 }
+                state = SpeechSynthesis.STOPPED;
+                failPendingUtterances();
                 callbackContext.sendPluginResult(new PluginResult(status, result));
             } else if (action.equals("isLanguageAvailable")) {
                 if (mTts != null) {
@@ -280,13 +295,25 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
         callbackContext.sendPluginResult(pr);
     }
 
-    private void fireErrorEvent(CallbackContext callbackContext) throws JSONException {
+    private void fireErrorEvent(CallbackContext callbackContext) {
         JSONObject error = new JSONObject();
-        error.put("type", "error");
-        error.put("charIndex", 0);
-        error.put("elapsedTime", 0);
-        error.put("name", "");
+        try {
+            error.put("type", "error");
+            error.put("charIndex", 0);
+            error.put("elapsedTime", 0);
+            error.put("name", "");
+        } catch (JSONException e) {
+            // Fixed keys and primitive values cannot fail in practice.
+        }
         callbackContext.sendPluginResult(new PluginResult(PluginResult.Status.ERROR, error));
+    }
+
+    private void failPendingUtterances() {
+        for (Map.Entry<String, CallbackContext> entry : utteranceCallbacks.entrySet()) {
+            if (utteranceCallbacks.remove(entry.getKey(), entry.getValue())) {
+                fireErrorEvent(entry.getValue());
+            }
+        }
     }
 
     /**
@@ -350,6 +377,8 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
         if (mTts != null) {
             mTts.shutdown();
         }
+        state = SpeechSynthesis.STOPPED;
+        failPendingUtterances();
     }
 
     /**
@@ -357,6 +386,9 @@ public class SpeechSynthesis extends CordovaPlugin implements OnInitListener, On
      * callback
      */
     public void onUtteranceCompleted(String utteranceId) {
-        fireEndEvent(callbackContext);
+        CallbackContext callbackContext = utteranceCallbacks.remove(utteranceId);
+        if (callbackContext != null) {
+            fireEndEvent(callbackContext);
+        }
     }
 }
